@@ -19,6 +19,7 @@
  ***************************************************************************/
 
 #include "DaemonApp.h"
+#include "Auth.h"
 
 #include "Configuration.h"
 #include "Constants.h"
@@ -126,6 +127,9 @@ int main(int argc, char **argv) {
         QTextStream(stdout) << DDM::mainConfig.toConfigFull();
         return EXIT_SUCCESS;
     }
+
+    if (arguments.contains(QStringLiteral("--session-helper")))
+        return DDM::runSessionHelper();
 
     // create application
     DDM::DaemonApp app(argc, argv);

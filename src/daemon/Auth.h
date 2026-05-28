@@ -11,6 +11,8 @@
 #include <QSocketNotifier>
 
 namespace DDM {
+    int runSessionHelper();
+
     class AuthPrivate;
     class UserSession;
 
@@ -96,6 +98,11 @@ namespace DDM {
         void sessionFinished();
 
     private:
+        int openSessionInHelperProcess(const QString &command,
+                                       const QProcessEnvironment &env,
+                                       const QByteArray &cookie,
+                                       QByteArray secret);
+
         /**
          * Write utmp/wtmp/btmp records when a user logs in
          *

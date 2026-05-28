@@ -34,8 +34,13 @@ namespace DDM {
     }
 
     QString SocketServer::socketAddress() const {
-        if (m_server)
-            return m_server->fullServerName();
+        if (m_server) {
+            const QString fullName = m_server->fullServerName();
+            if (!fullName.isEmpty())
+                return fullName;
+
+            return m_server->serverName();
+        }
         return QString();
     }
 

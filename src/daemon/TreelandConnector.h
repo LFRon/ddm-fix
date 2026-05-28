@@ -3,9 +3,9 @@
 
 #include <QObject>
 #include <QSocketNotifier>
+#include <QByteArray>
 
 struct wl_display;
-struct wl_callback;
 struct treeland_ddm_v1;
 
 namespace DDM {
@@ -19,17 +19,26 @@ public:
     void setSignalHandler();
     void connect(const QString socketPath);
     void disconnect();
+    int createGroupVtForTreeland(const QString &user, const QString &sessionId);
+    void destroyGroupVt(int vt);
 
     void switchToGreeter();
     void switchToUser(const QString username);
-    void ackVtSwitch(const int vtnr);
     void activateSession();
     void deactivateSession();
     void enableRender();
-    struct wl_callback *disableRender();
 private:
+    bool connectControlSocket();
+    void disconnectControlSocket();
+    void handleControlSocket();
+    int treelandMainPid() const;
+    bool sendDestroyGroupVt(int vt);
+
     struct wl_display *m_display { nullptr };
     QSocketNotifier *m_notifier { nullptr };
+    QSocketNotifier *m_controlNotifier { nullptr };
     struct treeland_ddm_v1 *m_ddm { nullptr };
+    int m_controlFd { -1 };
+    QByteArray m_controlBuffer;
 };
 }

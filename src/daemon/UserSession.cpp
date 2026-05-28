@@ -43,11 +43,69 @@
 #include <fcntl.h>
 #include <sched.h>
 #include <termios.h>
+#include <limits.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 
 namespace DDM {
+    namespace {
+        [[noreturn]] void childDie(const char *message) {
+            dprintf(STDERR_FILENO, "%s\n", message);
+            _exit(1);
+        }
+
+        [[noreturn]] void childDieErrno(const char *message) {
+            dprintf(STDERR_FILENO, "%s: %s\n", message, strerror(errno));
+            _exit(1);
+        }
+
+        void makeParentDirs(const char *filePath) {
+            char dir[PATH_MAX];
+            const size_t len = strnlen(filePath, sizeof(dir));
+            if (len == 0 || len >= sizeof(dir))
+                childDie("Invalid session log path");
+
+            memcpy(dir, filePath, len + 1);
+            char *lastSlash = strrchr(dir, '/');
+            if (!lastSlash)
+                return;
+            if (lastSlash == dir) {
+                return;
+            }
+            *lastSlash = '\0';
+
+            for (char *p = dir + 1; *p; ++p) {
+                if (*p != '/')
+                    continue;
+                *p = '\0';
+                if (mkdir(dir, 0700) != 0 && errno != EEXIST)
+                    childDieErrno("Failed to create session log directory");
+                *p = '/';
+            }
+            if (mkdir(dir, 0700) != 0 && errno != EEXIST)
+                childDieErrno("Failed to create session log directory");
+        }
+    }
+
     UserSession::UserSession(Auth *parent)
         : QProcess(parent) {
         setChildProcessModifier(std::bind(&UserSession::childModifier, this));
+    }
+
+    void UserSession::prepareChildContext(Display::DisplayServerType type) {
+        Auth *auth = qobject_cast<Auth *>(parent());
+        Q_ASSERT(auth);
+
+        m_sessionType = type;
+        m_userName = auth->user.toLocal8Bit();
+        m_ttyPath = VirtualTerminal::path(auth->tty).toLocal8Bit();
+        m_namespaces.clear();
+        for (const QString &ns : mainConfig.Namespaces.get())
+            m_namespaces << ns.toLocal8Bit();
+        m_sessionLogFile = (type == Display::X11
+                            ? mainConfig.X11.SessionLogFile.get()
+                            : mainConfig.Wayland.SessionLogFile.get()).toLocal8Bit();
+        m_xauthFd = m_xauthFile.handle();
     }
 
     void UserSession::start(const QString &command,
@@ -60,6 +118,7 @@ namespace DDM {
             setProgram(mainConfig.Single.SessionCommand.get());
             setArguments(QStringList{ command });
             qInfo() << "Starting Treeland session:" << program() << command;
+            prepareChildContext(type);
             QProcess::start();
             closeWriteChannel();
             closeReadChannel(QProcess::StandardOutput);
@@ -95,6 +154,7 @@ namespace DDM {
             qInfo() << "Starting X11 user session:" << command;
             setProgram(mainConfig.X11.SessionCommand.get());
             setArguments(QStringList{ command });
+            prepareChildContext(type);
             QProcess::start();
             return;
         }
@@ -102,6 +162,7 @@ namespace DDM {
             setProgram(mainConfig.Wayland.SessionCommand.get());
             setArguments(QStringList{ command });
             qInfo() << "Starting Wayland user session:" << program() << command;
+            prepareChildContext(type);
             QProcess::start();
             closeWriteChannel();
             closeReadChannel(QProcess::StandardOutput);
@@ -110,6 +171,49 @@ namespace DDM {
         default: {
             qCritical() << "Unable to run user session: unknown session type";
         }
+        }
+    }
+
+    qint64 UserSession::startDirect(const QString &command,
+                                    Display::DisplayServerType type,
+                                    const QByteArray &cookie) {
+        if (type != Display::Treeland) {
+            qCritical() << "Direct user session start only supports Treeland sessions";
+            return -1;
+        }
+        Q_UNUSED(cookie)
+
+        prepareChildContext(type);
+
+        QList<QByteArray> argvStorage{
+            mainConfig.Single.SessionCommand.get().toLocal8Bit(),
+            command.toLocal8Bit(),
+        };
+        QList<char *> argv;
+        for (QByteArray &arg : argvStorage)
+            argv << arg.data();
+        argv << nullptr;
+
+        QList<QByteArray> envStorage;
+        for (const QString &entry : processEnvironment().toStringList())
+            envStorage << entry.toLocal8Bit();
+        QList<char *> envp;
+        for (QByteArray &entry : envStorage)
+            envp << entry.data();
+        envp << nullptr;
+
+        qInfo() << "Starting Treeland session:" << argvStorage.first() << command;
+        const pid_t pid = fork();
+        switch (pid) {
+        case -1:
+            qWarning() << "Failed to fork Treeland session:" << strerror(errno);
+            return -1;
+        case 0:
+            childModifier();
+            execve(argv[0], argv.data(), envp.data());
+            childDieErrno("Failed to exec Treeland session");
+        default:
+            return pid;
         }
     }
 
@@ -129,14 +233,11 @@ namespace DDM {
     }
 
     void UserSession::childModifier() {
-        Auth *auth = qobject_cast<Auth *>(parent());
-
         // When the display server is part of the session, we leak the VT into
         // the session as stdin so that it stays open without races
-        if (auth->type != Display::X11) {
+        if (m_sessionType != Display::X11) {
             // open VT and get the fd
-            QString ttyString = VirtualTerminal::path(auth->tty);
-            int vtFd = ::open(qPrintable(ttyString), O_RDWR | O_NOCTTY);
+            int vtFd = ::open(m_ttyPath.constData(), O_RDWR | O_NOCTTY);
 
             // when this is true we'll take control of the tty
             bool takeControl = false;
@@ -153,82 +254,62 @@ namespace DDM {
 
             // set this process as session leader
             if (setsid() < 0) {
-                qCritical("Failed to set pid %lld as leader of the new session and process group: %s",
-                          QCoreApplication::applicationPid(), strerror(errno));
-                _exit(1);
+                childDieErrno("Failed to create a new session");
             }
 
             // take control of the tty
             if (takeControl) {
                 if (ioctl(STDIN_FILENO, TIOCSCTTY, 1) < 0) {
-                    const auto error = strerror(errno);
-                    qCritical().nospace() << "Failed to take control of " << ttyString << " (" << QFileInfo(ttyString).owner() << "): " << error;
-                    _exit(1);
+                    childDieErrno("Failed to take control of tty");
                 }
                 if (ioctl(STDIN_FILENO, KDSKBMODE, K_OFF) == -1) {
-                    qCritical().nospace() << "Failed to set keyboard mode to K_OFF";
-                    _exit(1);
+                    childDieErrno("Failed to set keyboard mode to K_OFF");
                 }
             }
         }
 
         // enter Linux namespaces
-        for (const QString &ns: mainConfig.Namespaces.get()) {
-            qInfo() << "Entering namespace" << ns;
-            int fd = ::open(qPrintable(ns), O_RDONLY);
-            if (fd < 0) {
-                qCritical("open(%s) failed: %s", qPrintable(ns), strerror(errno));
-                exit(1);
-            }
-            if (setns(fd, 0) != 0) {
-                qCritical("setns(open(%s), 0) failed: %s", qPrintable(ns), strerror(errno));
-                exit(1);
-            }
+        for (const QByteArray &ns: m_namespaces) {
+            int fd = ::open(ns.constData(), O_RDONLY);
+            if (fd < 0)
+                childDieErrno("Failed to open namespace");
+            if (setns(fd, 0) != 0)
+                childDieErrno("Failed to enter namespace");
             ::close(fd);
         }
 
         // switch user
-        const QByteArray username = auth->user.toLocal8Bit();
         struct passwd pw;
         struct passwd *rpw;
         long bufsize = sysconf(_SC_GETPW_R_SIZE_MAX);
         if (bufsize == -1)
             bufsize = 16384;
-        QScopedPointer<char, QScopedPointerPodDeleter> buffer(static_cast<char*>(malloc(bufsize)));
-        if (buffer.isNull()) {
-            qCritical() << "Could not allocate buffer of size" << bufsize;
-            exit(1);
-        }
-        int err = getpwnam_r(username.constData(), &pw, buffer.data(), bufsize, &rpw);
+        char *buffer = static_cast<char *>(malloc(bufsize));
+        if (!buffer)
+            childDie("Could not allocate passwd buffer");
+        int err = getpwnam_r(m_userName.constData(), &pw, buffer, bufsize, &rpw);
         if (rpw == NULL) {
-            if (err == 0)
-                qCritical() << "getpwnam_r(" << username << ") username not found!";
-            else
-                qCritical() << "getpwnam_r(" << username << ") failed with error: " << strerror(err);
-            exit(1);
+            if (err != 0)
+                errno = err;
+            childDieErrno("Failed to resolve session user");
         }
 
-        const int xauthHandle = m_xauthFile.handle();
-        if (xauthHandle != -1 && fchown(xauthHandle, pw.pw_uid, pw.pw_gid) != 0) {
-            qCritical() << "fchown failed for" << m_xauthFile.fileName();
-            exit(1);
-        }
+        if (m_xauthFd != -1 && fchown(m_xauthFd, pw.pw_uid, pw.pw_gid) != 0)
+            childDieErrno("Failed to change Xauthority owner");
 
-        if (setgid(pw.pw_gid) != 0) {
-            qCritical() << "setgid(" << pw.pw_gid << ") failed for user: " << username;
-            exit(1);
-        }
+        if (setgid(pw.pw_gid) != 0)
+            childDieErrno("Failed to set session gid");
 
         // fetch ambient groups from PAM's environment;
         // these are set by modules such as pam_groups.so
         int n_pam_groups = getgroups(0, NULL);
         gid_t *pam_groups = NULL;
         if (n_pam_groups > 0) {
-            pam_groups = new gid_t[n_pam_groups];
+            pam_groups = static_cast<gid_t *>(malloc(n_pam_groups * sizeof(gid_t)));
+            if (!pam_groups)
+                childDie("Could not allocate PAM groups");
             if ((n_pam_groups = getgroups(n_pam_groups, pam_groups)) == -1) {
-                qCritical() << "getgroups() failed to fetch supplemental"
-                            << "PAM groups for user:" << username;
-                exit(1);
+                childDieErrno("Failed to fetch supplemental PAM groups");
             }
         } else {
             n_pam_groups = 0;
@@ -238,14 +319,14 @@ namespace DDM {
         int n_user_groups = 0;
         gid_t *user_groups = NULL;
         if (-1 == getgrouplist(pw.pw_name, pw.pw_gid,
-                               NULL, &n_user_groups)) {
-            user_groups = new gid_t[n_user_groups];
+                                NULL, &n_user_groups)) {
+            user_groups = static_cast<gid_t *>(malloc(n_user_groups * sizeof(gid_t)));
+            if (!user_groups)
+                childDie("Could not allocate user groups");
             if ((n_user_groups = getgrouplist(pw.pw_name,
-                                              pw.pw_gid, user_groups,
-                                              &n_user_groups)) == -1 ) {
-                qCritical() << "getgrouplist(" << pw.pw_name << ", " << pw.pw_gid
-                            << ") failed";
-                exit(1);
+                                               pw.pw_gid, user_groups,
+                                               &n_user_groups)) == -1 ) {
+                childDie("Failed to fetch user groups");
             }
         }
 
@@ -253,64 +334,59 @@ namespace DDM {
         // groups and the session's user's groups
         int n_groups = n_pam_groups + n_user_groups;
         if (n_groups > 0) {
-            gid_t *groups = new gid_t[n_groups];
+            gid_t *groups = static_cast<gid_t *>(malloc(n_groups * sizeof(gid_t)));
+            if (!groups)
+                childDie("Could not allocate combined groups");
             memcpy(groups, pam_groups, (n_pam_groups * sizeof(gid_t)));
             memcpy((groups + n_pam_groups), user_groups,
                    (n_user_groups * sizeof(gid_t)));
 
             // setgroups(2) handles duplicate groups
-            if (setgroups(n_groups, groups) != 0) {
-                qCritical() << "setgroups() failed for user: " << username;
-                exit (1);
-            }
-            delete[] groups;
+            if (setgroups(n_groups, groups) != 0)
+                childDieErrno("Failed to set supplemental groups");
+            free(groups);
         }
-        delete[] pam_groups;
-        delete[] user_groups;
+        free(pam_groups);
+        free(user_groups);
 
-        if (setuid(pw.pw_uid) != 0) {
-            qCritical() << "setuid(" << pw.pw_uid << ") failed for user: " << username;
-            exit(1);
-        }
+        if (setuid(pw.pw_uid) != 0)
+            childDieErrno("Failed to set session uid");
 
-        if (chdir(pw.pw_dir) != 0) {
-            qCritical() << "chdir(" << pw.pw_dir << ") failed for user: " << username;
-            qCritical() << "verify directory exist and has sufficient permissions";
-            exit(1);
-        }
+        if (chdir(pw.pw_dir) != 0)
+            childDieErrno("Failed to change to user home directory");
 
         //we cannot use setStandardError file as this code is run in the child process
         //we want to redirect after we setuid so that the log file is owned by the user
 
         // determine stderr log file based on session type
-        QString sessionLog = QStringLiteral("%1/%2")
-            .arg(QString::fromLocal8Bit(pw.pw_dir))
-            .arg(auth->type == Display::X11
-                 ? mainConfig.X11.SessionLogFile.get()
-                 : mainConfig.Wayland.SessionLogFile.get());
+        char sessionLog[PATH_MAX];
+        if (!m_sessionLogFile.isEmpty() && m_sessionLogFile.constData()[0] == '/') {
+            if (snprintf(sessionLog, sizeof(sessionLog), "%s", m_sessionLogFile.constData()) >= static_cast<int>(sizeof(sessionLog)))
+                childDie("Session log path is too long");
+        } else if (snprintf(sessionLog, sizeof(sessionLog), "%s/%s", pw.pw_dir, m_sessionLogFile.constData()) >= static_cast<int>(sizeof(sessionLog))) {
+            childDie("Session log path is too long");
+        }
 
-        // create the path
-        QFileInfo finfo(sessionLog);
-        QDir().mkpath(finfo.absolutePath());
+        makeParentDirs(sessionLog);
 
         //swap the stderr pipe of this subprcess into a file
-        int fd = ::open(qPrintable(sessionLog), O_WRONLY | O_CREAT | O_TRUNC, 0600);
-        if (fd >= 0)
-            {
-                dup2 (fd, STDERR_FILENO);
-                ::close(fd);
-            } else {
-            qWarning() << "Could not open stderr to" << sessionLog;
+        int fd = ::open(sessionLog, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd >= 0) {
+            dup2 (fd, STDERR_FILENO);
+            ::close(fd);
+        } else {
+            dprintf(STDERR_FILENO, "Could not open stderr to %s: %s\n", sessionLog, strerror(errno));
         }
 
         //redirect any stdout to /dev/null
         fd = ::open("/dev/null", O_WRONLY);
-        if (fd >= 0)
-            {
-                dup2 (fd, STDOUT_FILENO);
-                ::close(fd);
-            } else {
-            qWarning() << "Could not redirect stdout";
+        if (fd >= 0) {
+            dup2 (fd, STDOUT_FILENO);
+            ::close(fd);
+        } else {
+            dprintf(STDERR_FILENO, "Could not redirect stdout: %s\n", strerror(errno));
         }
+
+        free(buffer);
     }
 }

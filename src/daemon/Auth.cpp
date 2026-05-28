@@ -11,14 +11,24 @@
 #include "SignalHandler.h"
 #include "VirtualTerminal.h"
 
+#include <QCoreApplication>
+#include <QDataStream>
+#include <QFile>
+
 #include <pwd.h>
 #include <security/pam_appl.h>
 #include <signal.h>
+#include <stdlib.h>
 #include <unistd.h>
+#include <sys/wait.h>
 #include <utmp.h>
 #include <utmpx.h>
 
 namespace DDM {
+    namespace {
+        bool s_runningSessionHelper = false;
+        int s_sessionHelperLifecycleFd = -1;
+    }
 
     ///////////////////////////
     // utmp helper functions //
@@ -162,6 +172,8 @@ namespace DDM {
         const char **secretPtr{};
         pam_conv conv{};
         int ret{};
+        QByteArray secret;
+        bool helperSession{ false };
     };
 
     Auth::Auth(QObject *parent, QString user)
@@ -176,7 +188,8 @@ namespace DDM {
                 kill(sessionPid, SIGTERM);
             if (sessionLeaderPid > 0)
                 kill(sessionLeaderPid, SIGTERM);
-            closeSession();
+            if (!d->helperSession)
+                closeSession();
             utmpLogout();
         }
         if (d->handle) {
@@ -214,8 +227,288 @@ namespace DDM {
         d->ret = pam_acct_mgmt(d->handle, 0);
         CHECK_RET_AUTH
 
+        d->secret = secret;
         authenticated = true;
         return true;
+    }
+
+    struct SessionHelperRequest {
+        QString user;
+        QByteArray secret;
+        QString command;
+        QStringList environment;
+        QByteArray cookie;
+        QString display;
+        int type = Display::Wayland;
+        int tty = 0;
+    };
+
+    struct SessionHelperResponse {
+        int xdgSessionId = -1;
+        qint64 sessionPid = -1;
+    };
+
+    static QDataStream &operator<<(QDataStream &stream, const SessionHelperRequest &request) {
+        stream << request.user
+               << request.secret
+               << request.command
+               << request.environment
+               << request.cookie
+               << request.display
+               << request.type
+               << request.tty;
+        return stream;
+    }
+
+    static QDataStream &operator>>(QDataStream &stream, SessionHelperRequest &request) {
+        stream >> request.user
+               >> request.secret
+               >> request.command
+               >> request.environment
+               >> request.cookie
+               >> request.display
+               >> request.type
+               >> request.tty;
+        return stream;
+    }
+
+    static QDataStream &operator<<(QDataStream &stream, const SessionHelperResponse &response) {
+        stream << response.xdgSessionId << response.sessionPid;
+        return stream;
+    }
+
+    static QDataStream &operator>>(QDataStream &stream, SessionHelperResponse &response) {
+        stream >> response.xdgSessionId >> response.sessionPid;
+        return stream;
+    }
+
+    static bool readAllFromFd(int fd, QByteArray *data) {
+        data->clear();
+        char buffer[4096];
+        while (true) {
+            const ssize_t bytes = read(fd, buffer, sizeof(buffer));
+            if (bytes > 0) {
+                data->append(buffer, qsizetype(bytes));
+                continue;
+            }
+            if (bytes == 0)
+                return true;
+            if (errno == EINTR)
+                continue;
+            return false;
+        }
+    }
+
+    static bool writeAllToFd(int fd, const QByteArray &data) {
+        qsizetype written = 0;
+        while (written < data.size()) {
+            const ssize_t bytes = write(fd, data.constData() + written, size_t(data.size() - written));
+            if (bytes > 0) {
+                written += bytes;
+                continue;
+            }
+            if (bytes < 0 && errno == EINTR)
+                continue;
+            return false;
+        }
+        return true;
+    }
+
+    static QByteArray serializeRequest(const SessionHelperRequest &request) {
+        QByteArray data;
+        QDataStream stream(&data, QIODevice::WriteOnly);
+        stream << request;
+        return data;
+    }
+
+    static QByteArray serializeResponse(const SessionHelperResponse &response) {
+        QByteArray data;
+        QDataStream stream(&data, QIODevice::WriteOnly);
+        stream << response;
+        return data;
+    }
+
+    static std::optional<SessionHelperResponse> deserializeResponse(const QByteArray &data) {
+        SessionHelperResponse response;
+        QDataStream stream(data);
+        stream >> response;
+        if (stream.status() != QDataStream::Ok)
+            return std::nullopt;
+        return response;
+    }
+
+    static std::optional<SessionHelperRequest> deserializeRequest(const QByteArray &data) {
+        SessionHelperRequest request;
+        QDataStream stream(data);
+        stream >> request;
+        if (stream.status() != QDataStream::Ok)
+            return std::nullopt;
+        return request;
+    }
+
+    int Auth::openSessionInHelperProcess(const QString &command,
+                                         const QProcessEnvironment &env,
+                                         const QByteArray &cookie,
+                                         QByteArray secret) {
+        int requestPipe[2];
+        int responsePipe[2];
+        int lifecyclePipe[2];
+        if (pipe(requestPipe) == -1) {
+            qWarning() << "[Auth] helper pipe failed:" << strerror(errno);
+            return -1;
+        }
+        if (pipe(responsePipe) == -1) {
+            qWarning() << "[Auth] helper pipe failed:" << strerror(errno);
+            close(requestPipe[0]);
+            close(requestPipe[1]);
+            return -1;
+        }
+        if (pipe(lifecyclePipe) == -1) {
+            qWarning() << "[Auth] helper pipe failed:" << strerror(errno);
+            close(requestPipe[0]);
+            close(requestPipe[1]);
+            close(responsePipe[0]);
+            close(responsePipe[1]);
+            return -1;
+        }
+
+        const pid_t helperPid = fork();
+        switch (helperPid) {
+        case -1:
+            qWarning() << "[Auth] helper fork failed:" << strerror(errno);
+            close(requestPipe[0]);
+            close(requestPipe[1]);
+            close(responsePipe[0]);
+            close(responsePipe[1]);
+            close(lifecyclePipe[0]);
+            close(lifecyclePipe[1]);
+            return -1;
+        case 0: {
+            dup2(requestPipe[0], STDIN_FILENO);
+            dup2(responsePipe[1], STDOUT_FILENO);
+            close(requestPipe[0]);
+            close(requestPipe[1]);
+            close(responsePipe[0]);
+            close(responsePipe[1]);
+            close(lifecyclePipe[0]);
+
+            const QByteArray lifecycleFd = QByteArray::number(lifecyclePipe[1]);
+            setenv("DDM_SESSION_HELPER_LIFECYCLE_FD", lifecycleFd.constData(), 1);
+            const QByteArray program = QFile::encodeName(QCoreApplication::applicationFilePath());
+            execl(program.constData(), program.constData(), "--session-helper", nullptr);
+            _exit(127);
+        }
+        default:
+            close(requestPipe[0]);
+            close(responsePipe[1]);
+            close(lifecyclePipe[1]);
+            break;
+        }
+
+        SessionHelperRequest request;
+        request.user = user;
+        request.secret = secret;
+        request.command = command;
+        request.environment = env.toStringList();
+        request.cookie = cookie;
+        request.display = display;
+        request.type = type;
+        request.tty = tty;
+
+        const QByteArray requestData = serializeRequest(request);
+        secret.fill('\0');
+        if (!writeAllToFd(requestPipe[1], requestData)) {
+            qWarning() << "[Auth] Failed to write session helper request:" << strerror(errno);
+            close(requestPipe[1]);
+            close(responsePipe[0]);
+            close(lifecyclePipe[0]);
+            return -1;
+        }
+        close(requestPipe[1]);
+
+        QByteArray responseData;
+        if (!readAllFromFd(responsePipe[0], &responseData)) {
+            qWarning() << "[Auth] Failed to read session helper response:" << strerror(errno);
+            close(responsePipe[0]);
+            close(lifecyclePipe[0]);
+            return -1;
+        }
+        close(responsePipe[0]);
+
+        auto response = deserializeResponse(responseData);
+        if (!response.has_value()) {
+            qWarning() << "[Auth] Invalid session helper response";
+            close(lifecyclePipe[0]);
+            return -1;
+        }
+
+        sessionLeaderPid = helperPid;
+        sessionPid = response->sessionPid;
+        xdgSessionId = response->xdgSessionId;
+
+        if (xdgSessionId <= 0 || sessionPid <= 0) {
+            qWarning() << "[Auth] Session helper failed to open session";
+            close(lifecyclePipe[0]);
+            return -1;
+        }
+
+        utmpLogin(true);
+        m_notifier = new QSocketNotifier(lifecyclePipe[0], QSocketNotifier::Read);
+        QObject::connect(m_notifier, &QSocketNotifier::activated, this, [this, lifecyclePipe] {
+            close(lifecyclePipe[0]);
+            m_notifier->setEnabled(false);
+            m_notifier->deleteLater();
+            Q_EMIT sessionFinished();
+        });
+
+        d->helperSession = true;
+        sessionOpened = true;
+        return xdgSessionId;
+    }
+
+    int runSessionHelper() {
+        QByteArray requestData;
+        if (!readAllFromFd(STDIN_FILENO, &requestData))
+            return EXIT_FAILURE;
+
+        auto request = deserializeRequest(requestData);
+        if (!request.has_value())
+            return EXIT_FAILURE;
+
+        s_runningSessionHelper = true;
+        if (const char *fd = getenv("DDM_SESSION_HELPER_LIFECYCLE_FD"))
+            s_sessionHelperLifecycleFd = atoi(fd);
+
+        Auth auth(nullptr, request->user);
+        auth.type = static_cast<Display::DisplayServerType>(request->type);
+        auth.tty = request->tty;
+        auth.display = request->display;
+
+        if (!auth.authenticate(request->secret))
+            return EXIT_FAILURE;
+        request->secret.fill('\0');
+
+        QProcessEnvironment env;
+        for (const QString &entry : request->environment) {
+            const qsizetype separator = entry.indexOf(QLatin1Char('='));
+            if (separator > 0)
+                env.insert(entry.left(separator), entry.mid(separator + 1));
+        }
+
+        const int xdgSessionId = auth.openSession(request->command, env, request->cookie);
+        if (xdgSessionId <= 0)
+            return EXIT_FAILURE;
+
+        const SessionHelperResponse response{ xdgSessionId, auth.sessionPid };
+        if (!writeAllToFd(STDOUT_FILENO, serializeResponse(response)))
+            return EXIT_FAILURE;
+        close(STDOUT_FILENO);
+
+        int status = 0;
+        if (waitpid(auth.sessionLeaderPid, &status, 0) < 0)
+            return EXIT_FAILURE;
+
+        return WIFEXITED(status) ? WEXITSTATUS(status) : EXIT_FAILURE;
     }
 
     int Auth::openSession(const QString &command,
@@ -223,14 +516,23 @@ namespace DDM {
                           const QByteArray &cookie) {
         Q_ASSERT(authenticated);
 
+        if (type == Display::Treeland && !s_runningSessionHelper) {
+            QByteArray secret = d->secret;
+            d->secret.fill('\0');
+            return openSessionInHelperProcess(command, env, cookie, secret);
+        }
+
         int pipefd[2];
         if (pipe(pipefd) == -1) {
             qWarning() << "[Auth] pipe failed:" << strerror(errno);
             return -1;
         }
 
-        // Here is most safe place to jump VT
-        VirtualTerminal::jumpToVt(tty, false, false);
+        // For Treeland sessions, switch VT after the session is registered in
+        // Display::login(), otherwise the release signal cannot be processed
+        // while this function is blocked waiting for the child process.
+        if (type != Display::Treeland)
+            VirtualTerminal::jumpToVt(tty, false, false);
 
         sessionLeaderPid = fork();
         switch (sessionLeaderPid) {
@@ -244,10 +546,16 @@ namespace DDM {
         case 0: {
             // Child (session leader) process
             close(pipefd[0]);
+            if (s_runningSessionHelper) {
+                close(STDOUT_FILENO);
+                if (s_sessionHelperLifecycleFd >= 0)
+                    close(s_sessionHelperLifecycleFd);
+            }
 
             // Delete old signal handlers, in order to close old fds
             // which are shared with the parent process.
-            delete daemonApp->signalHandler();
+            if (daemonApp)
+                delete daemonApp->signalHandler();
 
             // Restore default SIGINT and SIGTERM handlers. We need
             // the signal hander to terminate ourself, since we're
@@ -285,6 +593,36 @@ namespace DDM {
                 exit(1);
             }
 
+            if (type == Display::Treeland) {
+                UserSession session(this);
+                session.setProcessEnvironment(env);
+                sessionPid = session.startDirect(command, type, cookie);
+                if (sessionPid <= 0) {
+                    qCritical() << "[SessionLeader] Failed to start session process. Exit now.";
+                    exit(1);
+                }
+
+                if (write(pipefd[1], &sessionPid, sizeof(qint64)) != sizeof(qint64)) {
+                    qCritical() << "[SessionLeader] Failed to write session PID to parent process!";
+                    exit(1);
+                }
+                qInfo() << "[SessionLeader] Session started with PID" << sessionPid;
+
+                int status = 0;
+                if (waitpid(static_cast<pid_t>(sessionPid), &status, 0) < 0) {
+                    qCritical() << "[SessionLeader] Failed to wait session process:" << strerror(errno);
+                    exit(1);
+                }
+                if (WIFSIGNALED(status)) {
+                    qCritical() << "[SessionLeader] Session process crashed. Exit now.";
+                    exit(1);
+                }
+                const int exitCode = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+                qInfo() << "[SessionLeader] Session process finished with exit code"
+                        << exitCode << ". Exiting.";
+                exit(exitCode);
+            }
+
             // RUN!!!
             UserSession session(this);
             session.setProcessEnvironment(env);
@@ -317,13 +655,21 @@ namespace DDM {
             // Parent process
             close(pipefd[1]);
 
-            if (read(pipefd[0], &xdgSessionId, sizeof(int)) < 0) {
-                qWarning() << "[Auth] Failed to read XDG_SESSION_ID from child process:" << strerror(errno);
+            const ssize_t sessionIdBytes = read(pipefd[0], &xdgSessionId, sizeof(int));
+            if (sessionIdBytes != sizeof(int)) {
+                if (sessionIdBytes < 0)
+                    qWarning() << "[Auth] Failed to read XDG_SESSION_ID from child process:" << strerror(errno);
+                else
+                    qWarning() << "[Auth] Failed to read complete XDG_SESSION_ID from child process:" << sessionIdBytes;
                 close(pipefd[0]);
                 return -1;
             }
-            if (read(pipefd[0], &sessionPid, sizeof(qint64)) < 0) {
-                qWarning() << "[Auth] Failed to read session PID from child process:" << strerror(errno);
+            const ssize_t sessionPidBytes = read(pipefd[0], &sessionPid, sizeof(qint64));
+            if (sessionPidBytes != sizeof(qint64)) {
+                if (sessionPidBytes < 0)
+                    qWarning() << "[Auth] Failed to read session PID from child process:" << strerror(errno);
+                else
+                    qWarning() << "[Auth] Failed to read complete session PID from child process:" << sessionPidBytes;
                 close(pipefd[0]);
                 return -1;
             }

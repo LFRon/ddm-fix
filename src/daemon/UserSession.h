@@ -38,13 +38,23 @@ namespace DDM {
         void start(const QString &command,
                    Display::DisplayServerType type,
                    const QByteArray &cookie = QByteArray());
+        qint64 startDirect(const QString &command,
+                           Display::DisplayServerType type,
+                           const QByteArray &cookie = QByteArray());
         void stop();
 
     private:
         // Don't call it directly, it will be invoked by the child process only
         void childModifier();
+        void prepareChildContext(Display::DisplayServerType type);
 
         QTemporaryFile m_xauthFile;
+        Display::DisplayServerType m_sessionType = Display::Wayland;
+        QByteArray m_userName;
+        QByteArray m_ttyPath;
+        QList<QByteArray> m_namespaces;
+        QByteArray m_sessionLogFile;
+        int m_xauthFd = -1;
     };
 }
 
