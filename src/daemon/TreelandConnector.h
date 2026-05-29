@@ -24,9 +24,6 @@ public:
 
     void switchToGreeter();
     void switchToUser(const QString username);
-    void activateSession();
-    void deactivateSession();
-    void enableRender();
 private:
     bool connectControlSocket();
     void disconnectControlSocket();

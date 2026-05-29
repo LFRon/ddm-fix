@@ -7,7 +7,6 @@
 #include "Display.h"
 #include "DisplayManager.h"
 #include "SeatManager.h"
-#include "VirtualTerminal.h"
 #include "treeland-ddm-v1.h"
 
 #include <QObject>
@@ -193,7 +192,7 @@ void TreelandConnector::setSignalHandler() {
 // Event implementation
 
 static void switchToVt([[maybe_unused]] void *data, [[maybe_unused]] struct treeland_ddm_v1 *ddm, int32_t vtnr) {
-    VirtualTerminal::activateVt(vtnr, false);
+    qWarning("Ignoring deprecated treeland switch_to_vt request for VT %d; wlroots/libseat handles VT switching directly", vtnr);
 }
 
 static void acquireVt([[maybe_unused]] void *data, [[maybe_unused]] struct treeland_ddm_v1 *ddm, [[maybe_unused]] int32_t vtnr) {
@@ -293,6 +292,7 @@ bool TreelandConnector::connectControlSocket() {
     QObject::connect(m_controlNotifier, &QSocketNotifier::activated, this, [this] {
         handleControlSocket();
     });
+    qWarning("Connected dde-seatd control event socket fd=%d", m_controlFd);
     return true;
 }
 
@@ -415,8 +415,11 @@ int TreelandConnector::createGroupVtForTreeland(const QString &user, const QStri
     }
 
     close(fd);
-    if (vt > 0 && !connectControlSocket())
-        qWarning("Failed to reconnect dde-seatd control event socket");
+    if (vt > 0 && !connectControlSocket()) {
+        qWarning("Failed to reconnect dde-seatd control event socket, rolling back grouped VT %d", vt);
+        destroyGroupVt(vt);
+        return -1;
+    }
     return vt;
 }
 
@@ -453,8 +456,11 @@ void TreelandConnector::handleControlSocket() {
     char buffer[256];
     const auto bytes = read(m_controlFd, buffer, sizeof(buffer));
     if (bytes <= 0) {
-        if (bytes == 0 || errno != EAGAIN) {
+        if (bytes == 0) {
             qWarning("dde-seatd control socket disconnected");
+            disconnectControlSocket();
+        } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            qWarning("dde-seatd control socket read failed: %s", strerror(errno));
             disconnectControlSocket();
         }
         return;
@@ -477,19 +483,27 @@ void TreelandConnector::handleControlSocket() {
         if (header.opcode == ControlVtActive && header.size == sizeof(ControlVtEvent)) {
             ControlVtEvent event {};
             memcpy(&event, payload, sizeof(event));
-            if (isVtRunningTreeland(event.vt)) {
-                const auto user = findTreelandUserByVt(event.vt);
-                qDebug("Activate Treeland group VT %d for user %s",
-                       event.vt, qPrintable(user));
-                activateSession();
-                enableRender();
-                if (isTreelandGreeterVt(event.vt) || user == QStringLiteral("dde"))
+            const bool isTreelandVt = isVtRunningTreeland(event.vt);
+            const bool isGreeterVt = isTreelandGreeterVt(event.vt);
+            const auto user = findTreelandUserByVt(event.vt);
+            qWarning("dde-seatd VT active event: vt=%d ownerPid=%d isTreelandVt=%d isGreeterVt=%d user=%s connected=%d",
+                     event.vt,
+                     event.ownerPid,
+                     isTreelandVt,
+                     isGreeterVt,
+                     qPrintable(user),
+                     isConnected());
+            if (isTreelandVt) {
+                if (isGreeterVt || user == QStringLiteral("dde")) {
                     switchToGreeter();
-                else
+                } else {
                     switchToUser(user);
+                }
             } else {
-                deactivateSession();
+                qWarning("External VT %d became active; leaving Treeland deactivation to libseat", event.vt);
             }
+        } else {
+            qWarning("Ignored dde-seatd control message opcode=%u size=%u", header.opcode, header.size);
         }
         m_controlBuffer.remove(0, messageSize);
     }
@@ -499,6 +513,7 @@ void TreelandConnector::handleControlSocket() {
 
 void TreelandConnector::switchToGreeter() {
     if (isConnected()) {
+        qWarning("Calling treeland switch_to_greeter");
         treeland_ddm_v1_switch_to_greeter(m_ddm);
         wl_display_flush(m_display);
     } else {
@@ -508,37 +523,11 @@ void TreelandConnector::switchToGreeter() {
 
 void TreelandConnector::switchToUser(const QString username) {
     if (isConnected()) {
+        qWarning("Calling treeland switch_to_user: user=%s", qPrintable(username));
         treeland_ddm_v1_switch_to_user(m_ddm, qPrintable(username));
         wl_display_flush(m_display);
     } else {
         qWarning("Treeland is not connected when trying to call switchToUser");
-    }
-}
-
-void TreelandConnector::activateSession() {
-    if (isConnected()) {
-        treeland_ddm_v1_activate_session(m_ddm);
-        wl_display_flush(m_display);
-    } else {
-        qWarning("Treeland is not connected when trying to call activateSession");
-    }
-}
-
-void TreelandConnector::deactivateSession() {
-    if (isConnected()) {
-        treeland_ddm_v1_deactivate_session(m_ddm);
-        wl_display_flush(m_display);
-    } else {
-        qWarning("Treeland is not connected when trying to call deactivateSession");
-    }
-}
-
-void TreelandConnector::enableRender() {
-    if (isConnected()) {
-        treeland_ddm_v1_enable_render(m_ddm);
-        wl_display_flush(m_display);
-    } else {
-        qWarning("Treeland is not connected when trying to call enableRender");
     }
 }
 

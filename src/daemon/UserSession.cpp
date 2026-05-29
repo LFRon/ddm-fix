@@ -213,6 +213,9 @@ namespace DDM {
             execve(argv[0], argv.data(), envp.data());
             childDieErrno("Failed to exec Treeland session");
         default:
+            if (m_xauthFile.isOpen())
+                m_xauthFile.close();
+            m_xauthFd = -1;
             return pid;
         }
     }
