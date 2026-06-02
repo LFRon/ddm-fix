@@ -1,12 +1,15 @@
 // Copyright (C) 2025-2026 UnionTech Software Technology Co., Ltd.
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <QObject>
-#include <QSocketNotifier>
-#include <QString>
+#pragma once
 
-struct wl_display;
-struct treeland_ddm_v1;
+#include <QObject>
+
+#include <memory>
+
+class QLocalSocket;
+class QRemoteObjectNode;
+class TreelandRemoteReplica;
 
 namespace DDM {
 class TreelandConnector : public QObject {
@@ -15,16 +18,21 @@ public:
     explicit TreelandConnector(QObject *parent = nullptr);
     ~TreelandConnector();
     bool isConnected();
-    int mainPid();
-    void setPrivateObject(struct treeland_ddm_v1 *ddm);
-    void connect(const QString &socketPath);
+    int treelandMainPid() const;
+    void connect();
     void disconnect();
+
     void switchToGreeter();
     void switchToUser(const QString &username);
+    void lock();
 
+Q_SIGNALS:
+    void lockStateChanged(bool locked);
 private:
-    struct wl_display *m_display { nullptr };
-    QSocketNotifier *m_notifier { nullptr };
-    struct treeland_ddm_v1 *m_ddm { nullptr };
+    bool ensureRemote();
+
+    std::unique_ptr<QLocalSocket> m_remoteSocket;
+    std::unique_ptr<QRemoteObjectNode> m_remoteNode;
+    std::unique_ptr<TreelandRemoteReplica> m_remoteReplica;
 };
 }

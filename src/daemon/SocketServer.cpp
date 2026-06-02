@@ -20,17 +20,25 @@
 
 #include "SocketServer.h"
 
+#include "Auth.h"
 #include "DaemonApp.h"
-#include "Messages.h"
+#include "Display.h"
 #include "PowerManager.h"
-#include "SocketWriter.h"
 #include "TreelandConnector.h"
-#include "Utils.h"
 
+#include <QAbstractSocket>
 #include <QLocalServer>
+#include <QLocalSocket>
+#include <QRemoteObjectHost>
+
+static constexpr auto ddmRemoteSocketName = "org.deepin.dde.ddm.qro";
+static constexpr auto ddmRemoteSourceName = "DDMRemote";
 
 namespace DDM {
-    SocketServer::SocketServer(QObject *parent) : QObject(parent) {
+    SocketServer::SocketServer(Display *display, QObject *parent)
+        : DDMRemoteSimpleSource(parent)
+        , m_display(display)
+        , m_powerManager(daemonApp->powerManager()) {
     }
 
     QString SocketServer::socketAddress() const {
@@ -39,209 +47,141 @@ namespace DDM {
         return QString();
     }
 
-    bool SocketServer::start(const QString &displayName) {
+    bool SocketServer::start() {
         // check if the server has been created already
         if (m_server)
             return false;
 
-        QString socketName = QStringLiteral("ddm-%1-%2").arg(displayName).arg(generateName(6));
-
         // log message
         qDebug() << "Socket server starting...";
 
-        // create server
         m_server = new QLocalServer(this);
-
-        // set server options
         m_server->setSocketOptions(QLocalServer::UserAccessOption);
+        if (!m_server->listen(QString::fromLatin1(ddmRemoteSocketName))) {
+            if (m_server->serverError() != QAbstractSocket::AddressInUseError
+                    || !QLocalServer::removeServer(QString::fromLatin1(ddmRemoteSocketName))
+                    || !m_server->listen(QString::fromLatin1(ddmRemoteSocketName))) {
+                qCritical() << "Failed to start socket server.";
+                delete m_server;
+                m_server = nullptr;
+                return false;
+            }
+        }
 
-        // start listening
-        if (!m_server->listen(socketName)) {
-            // log message
-            qCritical() << "Failed to start socket server.";
-
-            // return fail
+        m_host = new QRemoteObjectHost(this);
+        if (!m_host->enableRemoting(this, QString::fromLatin1(ddmRemoteSourceName))) {
+            qCritical() << "Failed to enable DDMRemote source.";
+            m_server->close();
+            delete m_server;
+            m_server = nullptr;
+            delete m_host;
+            m_host = nullptr;
             return false;
         }
 
+        setHostName(daemonApp->hostName());
+        const auto capabilities = m_powerManager->capabilities();
+        setCanPowerOff(capabilities & Capability::PowerOff);
+        setCanReboot(capabilities & Capability::Reboot);
+        setCanSuspend(capabilities & Capability::Suspend);
+        setCanHibernate(capabilities & Capability::Hibernate);
+        setCanHybridSleep(capabilities & Capability::HybridSleep);
 
-        // log message
         qDebug() << "Socket server started.";
-
-        // connect signals
         connect(m_server, &QLocalServer::newConnection, this, &SocketServer::newConnection);
-
-        // return success
         return true;
     }
 
     void SocketServer::stop() {
-        // check flag
         if (!m_server)
             return;
 
-        // log message
         qDebug() << "Socket server stopping...";
-
-        // delete server
+        if (m_host) {
+            m_host->deleteLater();
+            m_host = nullptr;
+        }
+        m_server->close();
         m_server->deleteLater();
         m_server = nullptr;
-
-        // log message
         qDebug() << "Socket server stopped.";
     }
 
     void SocketServer::newConnection() {
-        // get pending connection
-        QLocalSocket *socket = m_server->nextPendingConnection();
+        while (m_server && m_server->hasPendingConnections()) {
+            auto *socket = m_server->nextPendingConnection();
+            if (!socket)
+                continue;
 
-        // connect signals
-        connect(socket, &QLocalSocket::readyRead, this, &SocketServer::readyRead);
-        connect(socket, &QLocalSocket::disconnected, socket, &QLocalSocket::deleteLater);
-        connect(socket, &QLocalSocket::disconnected, this, [this, socket] {
-            emit disconnected(socket);
-        });
-    }
-
-    void SocketServer::readyRead() {
-        QLocalSocket *socket = qobject_cast<QLocalSocket *>(sender());
-
-        // check socket
-        if (!socket)
-            return;
-
-        // input stream
-        QDataStream input(socket);
-
-        // Qt's QLocalSocket::readyRead is not designed to be called at every socket.write(),
-        // so we need to use a loop to read all the signals.
-        while(socket->bytesAvailable()) {
-            // read message
-            quint32 message;
-            input >> message;
-
-            switch (GreeterMessages(message)) {
-                case GreeterMessages::Connect: {
-                    // log message
-                    qDebug() << "Message received from greeter: Connect";
-
-                    // Connect wayland socket
-                    QString socketPath;
-                    input >> socketPath;
-                    daemonApp->treelandConnector()->connect(socketPath);
-
-                    // send capabilities
-                    SocketWriter(socket) << quint32(DaemonMessages::Capabilities) << quint32(daemonApp->powerManager()->capabilities());
-
-                    // send host name
-                    SocketWriter(socket) << quint32(DaemonMessages::HostName) << daemonApp->hostName();
-
-                    // emit signal
-                    emit connected(socket);
-                }
-                break;
-                case GreeterMessages::Login: {
-                    // log message
-                    qDebug() << "Message received from greeter: Login";
-
-                    // read username, pasword etc.
-                    QString user, password, filename;
-                    Session session;
-                    input >> user >> password >> session;
-
-                    // emit signal
-                    emit login(socket, user, password, session);
-                }
-                break;
-                case GreeterMessages::Logout: {
-                    // log message
-                    qDebug() << "Message received from greeter: Logout";
-                    // read username
-                    int id;
-                    input >> id;
-                    // emit signal
-                    emit logout(socket, id);
-                }
-                break;
-                case GreeterMessages::Lock : {
-                    // log message
-                    qDebug() << "Message received from greeter: Lock";
-                    int id;
-
-                    input >> id;
-                    emit lock(socket, id);
-                }
-                break;
-                case GreeterMessages::Unlock : {
-                    // log message
-                    qDebug() << "Message received from greeter: Unlock";
-                    QString user;
-                    QString password;
-
-                    input >> user >> password;
-                    emit unlock(socket, user, password);
-                }
-                break;
-                case GreeterMessages::PowerOff: {
-                    // log message
-                    qDebug() << "Message received from greeter: PowerOff";
-
-                    // power off
-                    daemonApp->powerManager()->powerOff();
-                }
-                break;
-                case GreeterMessages::Reboot: {
-                    // log message
-                    qDebug() << "Message received from greeter: Reboot";
-
-                    // reboot
-                    daemonApp->powerManager()->reboot();
-                }
-                break;
-                case GreeterMessages::Suspend: {
-                    // log message
-                    qDebug() << "Message received from greeter: Suspend";
-
-                    // suspend
-                    daemonApp->powerManager()->suspend();
-                }
-                break;
-                case GreeterMessages::Hibernate: {
-                    // log message
-                    qDebug() << "Message received from greeter: Hibernate";
-
-                    // hibernate
-                    daemonApp->powerManager()->hibernate();
-                }
-                break;
-                case GreeterMessages::HybridSleep: {
-                    // log message
-                    qDebug() << "Message received from greeter: HybridSleep";
-                    // hybrid sleep
-                    daemonApp->powerManager()->hybridSleep();
-                }
-                break;
-                case GreeterMessages::BackToNormal: {
-                    // log message
-                    qDebug() << "Message received from greeter: Back to normal";
-                    // hybrid sleep
-                    daemonApp->backToNormal();
-                }
-                break;
-                default: {
-                    // log message
-                    qWarning() << "Unknown message" << message;
-                }
-            }
+            connect(socket, &QLocalSocket::disconnected, socket, &QLocalSocket::deleteLater);
+            m_host->addHostSideConnection(socket);
         }
-
     }
 
-    void SocketServer::loginFailed(QLocalSocket *socket, const QString &user) {
-        SocketWriter(socket) << quint32(DaemonMessages::LoginFailed) << user;
+    bool SocketServer::connectGreeter() {
+        qDebug() << "Message received from greeter: Connect";
+        daemonApp->treelandConnector()->connect();
+        m_display->connected();
+        return true;
     }
 
-    void SocketServer::informationMessage(QLocalSocket *socket, const QString &message) {
-        SocketWriter(socket) << quint32(DaemonMessages::InformationMessage) << message;
+    void SocketServer::replayUserSessions() {
+        for (Auth *auth : std::as_const(m_display->auths)) {
+            if (auth->sessionOpened)
+                addUserSession(auth->user, auth->xdgSessionId);
+        }
+    }
+
+    void SocketServer::addUserSession(const QString &user, int sessionId) {
+        if (sessionId > 0)
+            emit userSessionAdded(user, sessionId);
+    }
+
+    void SocketServer::removeUserSession(const QString &user, int sessionId) {
+        if (sessionId > 0)
+            emit userSessionRemoved(user, sessionId);
+    }
+
+    bool SocketServer::login(QString user, QString password, int sessionType, QString sessionFile) {
+        qDebug() << "Message received from greeter: Login";
+        Session session(static_cast<Session::Type>(sessionType), sessionFile);
+        m_display->login(user, password, session);
+        return true;
+    }
+
+    bool SocketServer::logout(int id) {
+        qDebug() << "Message received from greeter: Logout";
+        m_display->logout(id);
+        return true;
+    }
+
+    bool SocketServer::powerOff() {
+        qDebug() << "Message received from greeter: PowerOff";
+        m_powerManager->powerOff();
+        return true;
+    }
+
+    bool SocketServer::reboot() {
+        qDebug() << "Message received from greeter: Reboot";
+        m_powerManager->reboot();
+        return true;
+    }
+
+    bool SocketServer::suspend() {
+        qDebug() << "Message received from greeter: Suspend";
+        m_powerManager->suspend();
+        return true;
+    }
+
+    bool SocketServer::hibernate() {
+        qDebug() << "Message received from greeter: Hibernate";
+        m_powerManager->hibernate();
+        return true;
+    }
+
+    bool SocketServer::hybridSleep() {
+        qDebug() << "Message received from greeter: HybridSleep";
+        m_powerManager->hybridSleep();
+        return true;
     }
 }

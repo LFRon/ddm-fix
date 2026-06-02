@@ -21,6 +21,8 @@
 #ifndef DDM_SOCKETSERVER_H
 #define DDM_SOCKETSERVER_H
 
+#include "rep_ddmremote_source.h"
+
 #include <QObject>
 #include <QString>
 
@@ -28,42 +30,45 @@
 
 class QLocalServer;
 class QLocalSocket;
+class QRemoteObjectHost;
 
 namespace DDM {
-    class SocketServer : public QObject {
+    class Display;
+    class PowerManager;
+
+    class SocketServer : public DDMRemoteSimpleSource {
         Q_OBJECT
         Q_DISABLE_COPY(SocketServer)
     public:
-        explicit SocketServer(QObject *parent = 0);
+        explicit SocketServer(Display *display, QObject *parent = 0);
 
-        bool start(const QString &sddmName);
+        bool start();
         void stop();
 
         QString socketAddress() const;
 
+        void replayUserSessions();
+        void addUserSession(const QString &user, int sessionId);
+        void removeUserSession(const QString &user, int sessionId);
+
     private slots:
         void newConnection();
-        void readyRead();
 
     public slots:
-        void informationMessage(QLocalSocket *socket, const QString &message);
-        void loginFailed(QLocalSocket *socket, const QString &user);
-
-    signals:
-        void login(QLocalSocket *socket,
-                   const QString &user, const QString &password,
-                   const Session &session);
-        void logout(QLocalSocket *socket,
-                    int id);
-        void lock(QLocalSocket *socket,
-                  int id);
-        void unlock(QLocalSocket *socket,
-                   const QString &user, const QString &password);
-        void connected(QLocalSocket *socket);
-        void disconnected(QLocalSocket *socket);
+        bool connectGreeter() override;
+        bool login(QString user, QString password, int sessionType, QString sessionFile) override;
+        bool logout(int id) override;
+        bool powerOff() override;
+        bool reboot() override;
+        bool suspend() override;
+        bool hibernate() override;
+        bool hybridSleep() override;
 
     private:
         QLocalServer *m_server { nullptr };
+        QRemoteObjectHost *m_host { nullptr };
+        Display *m_display { nullptr };
+        PowerManager *m_powerManager { nullptr };
     };
 }
 

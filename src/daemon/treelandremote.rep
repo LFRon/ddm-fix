@@ -1,0 +1,9 @@
+// Copyright (C) 2026 UnionTech Software Technology Co., Ltd.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+class TreelandRemote {
+    SLOT(void switchToGreeter());
+    SLOT(void switchToUser(QString username));
+    SLOT(void lock());
+    SIGNAL(lockStateChanged(bool locked));
+};
