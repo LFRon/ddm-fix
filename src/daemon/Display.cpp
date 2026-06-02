@@ -27,10 +27,8 @@
 #include "DaemonApp.h"
 #include "DdeSeatdControl.h"
 #include "DisplayManager.h"
-#include "Messages.h"
 #include "SeatManager.h"
 #include "SocketServer.h"
-#include "SocketWriter.h"
 #include "TreelandConnector.h"
 #include "TreelandDisplayServer.h"
 #include "XorgDisplayServer.h"
@@ -41,7 +39,6 @@
 #include <QDBusConnection>
 #include <QDebug>
 #include <QFile>
-#include <QLocalSocket>
 #include <QScopeGuard>
 
 #include <pwd.h>
@@ -139,16 +136,16 @@ namespace DDM {
         connect(m_socketServer, &SocketServer::connected, this, &Display::connected);
 
         // connect login signal
-        connect(m_socketServer, &SocketServer::login, this, &Display::login);
+        connect(m_socketServer, &SocketServer::loginRequested, this, &Display::login);
 
         // connect logout signal
-        connect(m_socketServer, &SocketServer::logout, this, &Display::logout);
+        connect(m_socketServer, &SocketServer::logoutRequested, this, &Display::logout);
 
         // connect lock signal
-        connect(m_socketServer, &SocketServer::lock, this, &Display::lock);
+        connect(m_socketServer, &SocketServer::lockRequested, this, &Display::lock);
 
         // connect unlock signal
-        connect(m_socketServer, &SocketServer::unlock,this, &Display::unlock);
+        connect(m_socketServer, &SocketServer::unlockRequested, this, &Display::unlock);
 
         // connect login result signals
         connect(this, &Display::loginFailed, m_socketServer, &SocketServer::loginFailed);
@@ -230,21 +227,19 @@ namespace DDM {
         emit stopped();
     }
 
-    void Display::connected(QLocalSocket *socket) {
+    void Display::connected() {
         // send logged in users (for possible crash recovery)
-        SocketWriter writer(socket);
         for (Auth *auth : std::as_const(auths)) {
             if (auth->sessionOpened)
-                writer << quint32(DaemonMessages::UserLoggedIn) << auth->user << auth->xdgSessionId;
+                m_socketServer->userLoggedIn(auth->user, auth->xdgSessionId);
         }
     }
 
-    void Display::login(QLocalSocket *socket,
-                        const QString &user, const QString &password,
+    void Display::login(const QString &user, const QString &password,
                         const Session &session) {
         if (user == QLatin1String("dde")) {
             qWarning() << "Login attempt for user dde";
-            emit loginFailed(socket, user);
+            emit loginFailed(user);
             return;
         }
 
@@ -304,7 +299,7 @@ namespace DDM {
                 auths.removeAll(auth);
                 delete auth;
             }
-            Q_EMIT loginFailed(socket, user);
+            Q_EMIT loginFailed(user);
             return;
         }
 
@@ -432,7 +427,7 @@ namespace DDM {
         qInfo() << "Successfully logged in user" << user;
     }
 
-    void Display::logout([[maybe_unused]] QLocalSocket *socket, int id) {
+    void Display::logout(int id) {
         qDebug() << "Logout requested for session id" << id;
         // Do not kill the session leader process before
         // TerminateSession! Logind will only kill the session's
@@ -447,7 +442,7 @@ namespace DDM {
         manager.TerminateSession(QString::number(id));
     }
 
-    void Display::lock([[maybe_unused]] QLocalSocket *socket, int id) {
+    void Display::lock(int id) {
         qDebug() << "Lock requested for session id" << id;
 
         OrgFreedesktopLogin1ManagerInterface manager(Logind::serviceName(),
@@ -456,9 +451,9 @@ namespace DDM {
         manager.LockSession(QString::number(id));
     }
 
-    void Display::unlock(QLocalSocket *socket, const QString &user, const QString &password) {
+    void Display::unlock(const QString &user, const QString &password) {
         if (user == QLatin1String("dde")) {
-            emit loginFailed(socket, user);
+            emit loginFailed(user);
             return;
         }
 
@@ -470,7 +465,7 @@ namespace DDM {
         // immediately after use
         Auth auth(this, user);
         if (!auth.authenticate(password.toLocal8Bit())) {
-            Q_EMIT loginFailed(socket, user);
+            Q_EMIT loginFailed(user);
             return;
         }
 
@@ -498,6 +493,6 @@ namespace DDM {
             }
         }
         qWarning() << "No active session found for user" << user;
-        Q_EMIT loginFailed(socket, user);
+        Q_EMIT loginFailed(user);
     }
 }

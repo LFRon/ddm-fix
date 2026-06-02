@@ -21,6 +21,8 @@
 #ifndef DDM_SOCKETSERVER_H
 #define DDM_SOCKETSERVER_H
 
+#include "rep_greeterddmremote_source.h"
+
 #include <QObject>
 #include <QString>
 
@@ -28,9 +30,10 @@
 
 class QLocalServer;
 class QLocalSocket;
+class QRemoteObjectHost;
 
 namespace DDM {
-    class SocketServer : public QObject {
+    class SocketServer : public GreeterDDMRemoteSimpleSource {
         Q_OBJECT
         Q_DISABLE_COPY(SocketServer)
     public:
@@ -43,27 +46,30 @@ namespace DDM {
 
     private slots:
         void newConnection();
-        void readyRead();
 
     public slots:
-        void informationMessage(QLocalSocket *socket, const QString &message);
-        void loginFailed(QLocalSocket *socket, const QString &user);
+        void connectGreeter() override;
+        void login(QString user, QString password, int sessionType, QString sessionFile) override;
+        void logout(int id) override;
+        void lock(int id) override;
+        void unlock(QString user, QString password) override;
+        void powerOff() override;
+        void reboot() override;
+        void suspend() override;
+        void hibernate() override;
+        void hybridSleep() override;
 
     signals:
-        void login(QLocalSocket *socket,
-                   const QString &user, const QString &password,
-                   const Session &session);
-        void logout(QLocalSocket *socket,
-                    int id);
-        void lock(QLocalSocket *socket,
-                  int id);
-        void unlock(QLocalSocket *socket,
-                   const QString &user, const QString &password);
-        void connected(QLocalSocket *socket);
-        void disconnected(QLocalSocket *socket);
+        void loginRequested(const QString &user, const QString &password, const Session &session);
+        void logoutRequested(int id);
+        void lockRequested(int id);
+        void unlockRequested(const QString &user, const QString &password);
+        void connected();
+        void disconnected();
 
     private:
         QLocalServer *m_server { nullptr };
+        QRemoteObjectHost *m_host { nullptr };
     };
 }
 
