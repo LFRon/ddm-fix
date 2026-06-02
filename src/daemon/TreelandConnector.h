@@ -3,11 +3,11 @@
 
 #include <QObject>
 #include <QLocalSocket>
-#include <QSocketNotifier>
 #include <QByteArray>
+#include <QScopedPointer>
 
-struct wl_display;
-struct treeland_ddm_v1;
+class QRemoteObjectNode;
+class TreelandDDMRemoteReplica;
 
 namespace DDM {
 class TreelandConnector : public QObject {
@@ -16,7 +16,6 @@ public:
     TreelandConnector();
     ~TreelandConnector();
     bool isConnected();
-    void setPrivateObject(struct treeland_ddm_v1 *ddm);
     void setSignalHandler();
     void connect(const QString socketPath);
     void disconnect();
@@ -26,16 +25,17 @@ public:
     void switchToGreeter();
     void switchToUser(const QString username);
 private:
+    bool ensureRemote();
     bool connectControlSocket();
     void disconnectControlSocket();
     void handleControlSocket();
     int treelandMainPid() const;
     bool sendDestroyGroupVt(int vt);
 
-    struct wl_display *m_display { nullptr };
-    QSocketNotifier *m_notifier { nullptr };
     QLocalSocket *m_controlSocket { nullptr };
-    struct treeland_ddm_v1 *m_ddm { nullptr };
+    QScopedPointer<QLocalSocket> m_remoteSocket;
+    QScopedPointer<QRemoteObjectNode> m_remoteNode;
+    QScopedPointer<TreelandDDMRemoteReplica> m_remoteReplica;
     QByteArray m_controlBuffer;
 };
 }

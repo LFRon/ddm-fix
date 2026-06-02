@@ -7,20 +7,18 @@
 #include "Display.h"
 #include "DisplayManager.h"
 #include "SeatManager.h"
-#include "treeland-ddm-v1.h"
+#include "rep_treelandddmremote_replica.h"
 
 #include <QObject>
 #include <QDBusInterface>
 #include <QDBusObjectPath>
 #include <QDBusReply>
 #include <QDBusVariant>
+#include <QFile>
 #include <QLocalSocket>
-#include <QSocketNotifier>
 #include <QDebug>
+#include <QRemoteObjectNode>
 #include <QVariant>
-
-#include <wayland-client-core.h>
-#include <wayland-client-protocol.h>
 
 #include <algorithm>
 #include <array>
@@ -30,6 +28,7 @@
 #include <fcntl.h>
 #include <limits>
 #include <poll.h>
+#include <pwd.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
@@ -46,6 +45,8 @@ static constexpr auto systemdPropertiesInterface = "org.freedesktop.DBus.Propert
 static constexpr auto systemdServiceInterface = "org.freedesktop.systemd1.Service";
 static constexpr auto treelandUnit = "treeland.service";
 static constexpr uint16_t maxControlPayloadSize = 4096;
+static constexpr auto treelandRemoteSocketName = "org.deepin.TreelandDDMRemote";
+static constexpr auto treelandServiceCgroup = "/treeland.service";
 
 enum ControlOpcode : uint16_t {
     ControlCreateGroupVt = 1,
@@ -84,6 +85,58 @@ struct ControlVtChangeEvent {
 struct ControlErrorMessage {
     int32_t error;
 };
+
+static bool readPeerCredentials(qintptr socketDescriptor, struct ucred *credentials)
+{
+    const auto fd = static_cast<int>(socketDescriptor);
+    if (fd < 0)
+        return false;
+
+    socklen_t length = sizeof(*credentials);
+    return getsockopt(fd, SOL_SOCKET, SO_PEERCRED, credentials, &length) == 0
+        && length == sizeof(*credentials);
+}
+
+static bool peerCgroupContains(pid_t pid, const QString &marker)
+{
+    QFile file(QStringLiteral("/proc/%1/cgroup").arg(pid));
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text))
+        return false;
+
+    while (!file.atEnd()) {
+        if (QString::fromUtf8(file.readLine()).contains(marker))
+            return true;
+    }
+
+    return false;
+}
+
+static bool isExpectedTreelandPeer(const QLocalSocket &socket)
+{
+    struct ucred credentials {};
+    if (!readPeerCredentials(socket.socketDescriptor(), &credentials)) {
+        qWarning() << "Failed to read Treeland peer credentials:" << strerror(errno);
+        return false;
+    }
+
+    const passwd *ddeUser = getpwnam("dde");
+    if (!ddeUser) {
+        qWarning() << "Failed to resolve dde user while validating Treeland peer";
+        return false;
+    }
+    if (credentials.uid != ddeUser->pw_uid) {
+        qWarning() << "Rejecting Treeland remote peer with unexpected uid" << credentials.uid;
+        return false;
+    }
+
+    if (!peerCgroupContains(credentials.pid, QString::fromLatin1(treelandServiceCgroup))) {
+        qWarning() << "Rejecting Treeland remote peer outside treeland.service cgroup:"
+                   << credentials.pid;
+        return false;
+    }
+
+    return true;
+}
 
 static int connectUnixSocket(const char *path) {
     int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -205,106 +258,84 @@ TreelandConnector::TreelandConnector() : QObject(nullptr) {
 }
 
 TreelandConnector::~TreelandConnector() {
-    disconnectControlSocket();
-    delete m_notifier;
-    if (m_display)
-        wl_display_disconnect(m_display);
+    disconnect();
 }
 
 bool TreelandConnector::isConnected() {
-    return m_ddm;
-}
-
-void TreelandConnector::setPrivateObject(struct treeland_ddm_v1 *ddm) {
-    m_ddm = ddm;
+    return m_remoteReplica && m_remoteReplica->state() == QRemoteObjectReplica::Valid;
 }
 
 void TreelandConnector::setSignalHandler() {
 }
 
-// Event implementation
-
-static void switchToVt([[maybe_unused]] void *data, [[maybe_unused]] struct treeland_ddm_v1 *ddm, int32_t vtnr) {
-    qWarning("Ignoring deprecated treeland switch_to_vt request for VT %d; wlroots/libseat handles VT switching directly", vtnr);
-}
-
-static void acquireVt([[maybe_unused]] void *data, [[maybe_unused]] struct treeland_ddm_v1 *ddm, [[maybe_unused]] int32_t vtnr) {
-}
-
-const struct treeland_ddm_v1_listener treelandDDMListener {
-    .switch_to_vt = switchToVt,
-    .acquire_vt = acquireVt,
-};
-
-// wayland object binding
-
-void registerGlobal(void *data, struct wl_registry *registry, uint32_t name, const char *interface, uint32_t version) {
-    if (strcmp(interface, "treeland_ddm_v1") == 0) {
-        auto connector = static_cast<TreelandConnector *>(data);
-        auto ddm = static_cast<struct treeland_ddm_v1 *>(
-            wl_registry_bind(registry, name, &treeland_ddm_v1_interface, version)
-        );
-        treeland_ddm_v1_add_listener(ddm, &treelandDDMListener, connector);
-        connector->setPrivateObject(ddm);
-        qDebug("Connected to treeland_ddm global object");
-    }
-}
-
-void removeGlobal([[maybe_unused]] void *data, [[maybe_unused]] struct wl_registry *registry, [[maybe_unused]] uint32_t name) {
-    // Do not deregister the global object (set m_ddm to null) here,
-    // as wlroots will send global_remove event when session deactivated,
-    // which is not what we want. The connection will be preserved after that.
-}
-
-const struct wl_registry_listener registryListener {
-    .global = registerGlobal,
-    .global_remove = removeGlobal,
-};
-
 void TreelandConnector::connect(QString socketPath) {
-    disconnect();
+    Q_UNUSED(socketPath)
+
     if (!connectControlSocket()) {
         qCritical("Cannot connect Treeland without dde-seatd control socket");
         return;
     }
-
-    m_display = wl_display_connect(qPrintable(socketPath));
-    if (m_display == nullptr) {
-        qWarning("Failed to connect to Treeland Wayland socket %s", qPrintable(socketPath));
-        return;
-    }
-    auto registry = wl_display_get_registry(m_display);
-
-    wl_registry_add_listener(registry, &registryListener, this);
-
-    wl_display_roundtrip(m_display);
-
-    while (wl_display_dispatch_pending(m_display) > 0);
-    wl_display_flush(m_display);
-    m_notifier = new QSocketNotifier(wl_display_get_fd(m_display), QSocketNotifier::Read);
-    QObject::connect(m_notifier, &QSocketNotifier::activated, this, [this] {
-        if (wl_display_dispatch(m_display) == -1 || wl_display_flush(m_display) == -1) {
-            if (errno != EAGAIN) {
-                qWarning("Treeland connection lost!");
-                disconnect();
-            }
-        }
-    });
+    ensureRemote();
 }
 
 void TreelandConnector::disconnect() {
     disconnectControlSocket();
-    if (m_display) {
-        if (m_notifier)
-            m_notifier->setEnabled(false);
-        wl_display_disconnect(m_display);
-        if (m_notifier) {
-            m_notifier->deleteLater();
-            m_notifier = nullptr;
-        }
-        m_display = nullptr;
+    m_remoteReplica.reset();
+    if (m_remoteSocket)
+        m_remoteSocket->disconnectFromServer();
+    m_remoteSocket.reset();
+    m_remoteNode.reset();
+}
+
+bool TreelandConnector::ensureRemote() {
+    if (isConnected())
+        return true;
+
+    if (!m_remoteNode) {
+        m_remoteNode.reset(new QRemoteObjectNode);
     }
-    m_ddm = nullptr;
+
+    if (!m_remoteSocket) {
+        m_remoteSocket.reset(new QLocalSocket(this));
+        QObject::connect(m_remoteSocket.get(), &QLocalSocket::disconnected, this, [this] {
+            m_remoteReplica.reset();
+            m_remoteSocket.reset();
+            m_remoteNode.reset();
+        });
+
+        m_remoteSocket->connectToServer(QString::fromLatin1(treelandRemoteSocketName));
+        if (!m_remoteSocket->waitForConnected(3000)) {
+            qWarning() << "Failed to connect Treeland remote socket:"
+                       << m_remoteSocket->errorString();
+            m_remoteSocket.reset();
+            m_remoteNode.reset();
+            return false;
+        }
+
+        if (!isExpectedTreelandPeer(*m_remoteSocket)) {
+            m_remoteSocket->disconnectFromServer();
+            m_remoteSocket.reset();
+            m_remoteNode.reset();
+            return false;
+        }
+
+        m_remoteNode->addClientSideConnection(m_remoteSocket.get());
+    }
+
+    if (!m_remoteReplica) {
+        m_remoteReplica.reset(m_remoteNode->acquire<TreelandDDMRemoteReplica>());
+        QObject::connect(m_remoteReplica.get(), &QRemoteObjectReplica::stateChanged, this,
+                         [this](QRemoteObjectReplica::State state, QRemoteObjectReplica::State oldState) {
+                             qInfo() << "Treeland remote replica state changed from" << oldState << "to" << state;
+                         });
+        if (!m_remoteReplica->waitForSource(3000)) {
+            qWarning() << "Timed out waiting for Treeland remote source";
+            m_remoteReplica.reset();
+            return false;
+        }
+    }
+
+    return isConnected();
 }
 
 bool TreelandConnector::connectControlSocket() {
@@ -560,23 +591,23 @@ void TreelandConnector::handleControlSocket() {
 // Request wrapper
 
 void TreelandConnector::switchToGreeter() {
-    if (isConnected()) {
-        qDebug("Calling treeland switch_to_greeter");
-        treeland_ddm_v1_switch_to_greeter(m_ddm);
-        wl_display_flush(m_display);
-    } else {
+    if (!ensureRemote()) {
         qWarning("Treeland is not connected when trying to call switchToGreeter");
+        return;
     }
+
+    qDebug("Calling treeland switchToGreeter");
+    m_remoteReplica->switchToGreeter();
 }
 
 void TreelandConnector::switchToUser(const QString username) {
-    if (isConnected()) {
-        qDebug("Calling treeland switch_to_user: user=%s", qPrintable(username));
-        treeland_ddm_v1_switch_to_user(m_ddm, qPrintable(username));
-        wl_display_flush(m_display);
-    } else {
+    if (!ensureRemote()) {
         qWarning("Treeland is not connected when trying to call switchToUser");
+        return;
     }
+
+    qDebug("Calling treeland switchToUser: user=%s", qPrintable(username));
+    m_remoteReplica->switchToUser(username);
 }
 
 }
