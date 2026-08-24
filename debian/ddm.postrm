@@ -4,9 +4,21 @@ set -e
 DEFAULT_DISPLAY_MANAGER_FILE=/etc/X11/default-display-manager
 DEFAULT_SERVICE=/etc/systemd/system/display-manager.service
 
+# Remove the cap_ipc_owner file capability granted at install time (see
+# ddm.postinst).  Only runs on remove/purge; upgrades keep the cap.
+cleanup_xwayland_cap() {
+    if command -v setcap >/dev/null 2>&1; then
+        for BIN in "$(command -v Xwayland 2>/dev/null || true)" /usr/bin/Xwayland; do
+            [ -z "$BIN" ] && continue
+            [ -x "$BIN" ] && setcap -r "$BIN" 2>/dev/null || true
+        done
+    fi
+}
+
 case "$1" in
     purge)
         update-rc.d ddm remove > /dev/null
+        cleanup_xwayland_cap
 
         if [ -d /var/cache/ddm ]; then rm -r /var/cache/ddm; fi
         if [ -d /var/lib/ddm ]; then rm -r /var/lib/ddm; fi
@@ -35,6 +47,7 @@ case "$1" in
 
         ;;
     remove)
+        cleanup_xwayland_cap
         # Update the display-manager.service symlink to point to the newly
         # chosen display manager (written by prerm into DEFAULT_DISPLAY_MANAGER_FILE)
         if [ -e "$DEFAULT_DISPLAY_MANAGER_FILE" ] && [ -d /etc/systemd/system/ ]; then
