@@ -34,13 +34,52 @@
 #include <QDBusConnectionInterface>
 #include <QDBusInterface>
 #include <QDebug>
+#include <QFile>
+#include <QFileInfo>
 #include <QHostInfo>
+#include <QProcess>
+#include <QStandardPaths>
 #include <QTimer>
 
 #include <iostream>
 
 namespace DDM {
     DaemonApp *DaemonApp::self = nullptr;
+
+    static void applyXwaylandIpcCapability()
+    {
+        const QStringList candidates = [&]() -> QStringList {
+            QStringList list;
+            const QString found = QStandardPaths::findExecutable(QStringLiteral("Xwayland"));
+            if (!found.isEmpty())
+                list << found;
+            list << QStringLiteral("/usr/bin/Xwayland");
+            return list;
+        }();
+
+        const QString setcapBin = []() -> QString {
+            QString bin = QStandardPaths::findExecutable(QStringLiteral("setcap"));
+            if (bin.isEmpty() && QFile::exists(QStringLiteral("/usr/sbin/setcap")))
+                bin = QStringLiteral("/usr/sbin/setcap");
+            return bin;
+        }();
+        if (setcapBin.isEmpty()) {
+            qWarning() << "setcap not found, cannot grant cap_ipc_owner to Xwayland";
+            return;
+        }
+
+        for (const QString &path : std::as_const(candidates)) {
+            if (!QFile::exists(path) || !QFileInfo(path).isExecutable())
+                continue;
+            const int ret = QProcess::execute(setcapBin,
+                                              { QStringLiteral("cap_ipc_owner=ep"), path });
+            if (ret == 0)
+                qInfo() << "Granted cap_ipc_owner to" << path;
+            else
+                qWarning() << "setcap on" << path << "failed (exit" << ret << ")";
+            break;
+        }
+    }
 
     DaemonApp::DaemonApp(int &argc, char **argv) : QCoreApplication(argc, argv) {
         // point instance to this
@@ -94,6 +133,17 @@ namespace DDM {
             qWarning() << "Failed to connect dde-seatd event socket during startup";
         // log message
         qDebug() << "Starting...";
+
+        // Xwayland runs as the display manager's user (e.g. "dde") while
+        // desktop X11 clients may be launched by the real login user.
+        // MIT-SHM (XShmPutImage) fails with BadAccess when the SysV shared
+        // memory segment UID differs from the X server UID ── shmat() is
+        // denied by the kernel.  Grant cap_ipc_owner to the Xwayland binary
+        // so it can attach segments created by any user on the machine.
+        // The X server still enforces its own per-client access check
+        // (Xext/shm.c:shm_access, which verifies the client owns the seg).
+        // See also: debian/ddm.postinst (install-time) and postrm (cleanup).
+        applyXwaylandIpcCapability();
 
         m_seatManager->initialize();
     }

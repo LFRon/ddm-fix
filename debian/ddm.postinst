@@ -64,6 +64,26 @@ fi
 touch /var/log/ddm.log
 chown dde:dde /var/log/ddm.log
 
+# Xwayland runs as the display-manager user (e.g. "dde") while X11 clients
+# (e.g. Electron apps) may be launched by the real login user. MIT-SHM
+# (XShmPutImage) fails with BadAccess when the SysV shared memory segment UID
+# differs from the X server UID, leaving such windows blank. Grant cap_ipc_owner
+# to the Xwayland binary so shmat() can attach segments of any user; the X
+# server still enforces its own per-client access check (Xext/shm.c:shm_access).
+# The daemon re-applies this at startup too, in case an Xwayland package
+# upgrade clears the file capability.
+if command -v setcap >/dev/null 2>&1; then
+    XWAYLAND_BIN="$(command -v Xwayland 2>/dev/null || true)"
+    if [ -z "$XWAYLAND_BIN" ]; then
+        XWAYLAND_BIN=/usr/bin/Xwayland
+    fi
+    if [ -x "$XWAYLAND_BIN" ]; then
+        if ! setcap cap_ipc_owner=ep "$XWAYLAND_BIN" 2>/dev/null; then
+            echo "ddm: warning: failed to set cap_ipc_owner on $XWAYLAND_BIN" >&2
+        fi
+    fi
+fi
+
 #DEBHELPER#
 
 exit 0
